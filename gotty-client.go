@@ -4,21 +4,26 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/c-bata/go-prompt"
+	"github.com/creack/goselect"
+	"github.com/gorilla/websocket"
+	"github.com/imroc/req"
+	"github.com/nsf/termbox-go"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/crypto/ssh/terminal"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
-
-	"github.com/containerd/console"
-	"github.com/creack/goselect"
-	"github.com/gorilla/websocket"
-	"github.com/sirupsen/logrus"
 )
 
 // message types for gotty
@@ -135,6 +140,10 @@ type Client struct {
 	V2              bool
 	message         *gottyMessageType
 	WSOrigin        string
+	Webconsole      bool // webconsole 模式
+	Username        string
+	Password        string
+	ServerAddr      string
 }
 
 type querySingleType struct {
@@ -194,8 +203,118 @@ func (c *Client) GetAuthToken() (string, error) {
 	return output[1], nil
 }
 
+// WebConsoleURLParse 解析输入的 url
+func (c *Client) WebConsoleURLParse() (*url.URL, error) {
+	u, err := url.Parse(c.URL)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// GetWebConsoleToken 获取 WebConsole token
+func (c *Client) GetWebConsoleToken() (string, error) {
+	u, err := c.WebConsoleURLParse()
+	if err != nil {
+		return "", err
+	}
+	tokenReg := regexp.MustCompile("/console/main/(?P<token>\\w+)")
+	if token := tokenReg.FindStringSubmatch(u.Path); len(token) > 1 && token[1] != "" {
+		return token[1], nil
+	}
+
+	completer := func(in prompt.Document) []prompt.Suggest {
+		return prompt.FilterHasPrefix([]prompt.Suggest{}, in.GetWordBeforeCursor(), true)
+	}
+
+	if c.ServerAddr == "" {
+		c.ServerAddr = prompt.Input("Enter ServerAddr: ", completer)
+	}
+
+	if c.Username == "" {
+		c.Username = prompt.Input("Enter Username: ", completer)
+		fmt.Print("Enter Password: ")
+		bytePassword, err := terminal.ReadPassword(int(syscall.Stdin))
+		if err == nil {
+			c.Password = strings.TrimSpace(string(bytePassword))
+		} else {
+			return "", err
+		}
+		fmt.Println()
+	}
+
+	//req.Debug = true
+	loginUrl := &url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/console/login"}
+	resp, err := req.Post(loginUrl.String(), req.Param{
+		"vm_addr":   c.ServerAddr,
+		"user_name": c.Username,
+		"user_pwd":  c.Password,
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	token := &struct {
+		OK   bool   `json:"ok"`
+		Msg  string `json:"msg"`
+		Data string `json:"data"`
+	}{}
+
+	if err := resp.ToJSON(token); err != nil {
+		return "", err
+	}
+
+	if token.OK {
+		return filepath.Base(token.Data), nil
+	}
+	return "", errors.New(token.Msg)
+}
+
+// GetWebConsoleWsURL 获取 webconsole 的 websocket url
+func (c *Client) GetWebConsoleWsURL() (*url.URL, error) {
+	token, err := c.GetWebConsoleToken()
+	if err != nil {
+		return nil, err
+	}
+	u, err := c.WebConsoleURLParse()
+	if err != nil {
+		return nil, err
+	}
+
+	wsSchema := "ws"
+	if u.Scheme == "https" {
+		wsSchema = "wss"
+	}
+	wsUrl := &url.URL{Scheme: wsSchema, Host: u.Host, Path: "/console/sshws/" + token}
+
+	return wsUrl, nil
+}
+
 // Connect tries to dial a websocket server
 func (c *Client) Connect() error {
+	if c.Webconsole {
+		wsUrl, err := c.GetWebConsoleWsURL()
+		if err != nil {
+			return err
+		}
+		if c.UseProxyFromEnv {
+			c.Dialer.Proxy = http.ProxyFromEnvironment
+		}
+		if err := termbox.Init(); err != nil {
+			panic(err)
+		}
+		w, h := termbox.Size()
+		termbox.Close()
+		conn, _, err := c.Dialer.Dial(wsUrl.String()+"?cols="+fmt.Sprint(w)+"&rows="+fmt.Sprint(h), http.Header{})
+		if err != nil {
+			return err
+		}
+		c.Conn = conn
+		c.Connected = true
+		c.initMessageType()
+		return nil
+	}
 	// Retrieve AuthToken
 	authToken, err := c.GetAuthToken()
 	if err != nil {
@@ -248,7 +367,6 @@ func (c *Client) Connect() error {
 
 	// Initialize message types for gotty
 	c.initMessageType()
-
 	go c.pingLoop()
 
 	return nil
@@ -256,27 +374,32 @@ func (c *Client) Connect() error {
 
 // initMessageType initialize message types for gotty
 func (c *Client) initMessageType() {
-	if c.V2 {
+	if c.Webconsole {
 		c.message = &gottyMessageType{
-			output:         Output,
-			pong:           Pong,
-			setWindowTitle: SetWindowTitle,
-			setPreferences: SetPreferences,
-			setReconnect:   SetReconnect,
-			input:          Input,
-			ping:           Ping,
-			resizeTerminal: ResizeTerminal,
 		}
 	} else {
-		c.message = &gottyMessageType{
-			output:         OutputV1,
-			pong:           PongV1,
-			setWindowTitle: SetWindowTitleV1,
-			setPreferences: SetPreferencesV1,
-			setReconnect:   SetReconnectV1,
-			input:          InputV1,
-			ping:           PingV1,
-			resizeTerminal: ResizeTerminalV1,
+		if c.V2 {
+			c.message = &gottyMessageType{
+				output:         Output,
+				pong:           Pong,
+				setWindowTitle: SetWindowTitle,
+				setPreferences: SetPreferences,
+				setReconnect:   SetReconnect,
+				input:          Input,
+				ping:           Ping,
+				resizeTerminal: ResizeTerminal,
+			}
+		} else {
+			c.message = &gottyMessageType{
+				output:         OutputV1,
+				pong:           PongV1,
+				setWindowTitle: SetWindowTitleV1,
+				setPreferences: SetPreferencesV1,
+				setReconnect:   SetReconnectV1,
+				input:          InputV1,
+				ping:           PingV1,
+				resizeTerminal: ResizeTerminalV1,
+			}
 		}
 	}
 }
@@ -310,17 +433,30 @@ func (c *Client) Loop() error {
 			return err
 		}
 	}
-	term := console.Current()
-	err := term.SetRaw()
+
+	//term := console.Current()
+	//err := term.SetRaw()
+	//if err != nil {
+	//	return fmt.Errorf("Error setting raw terminal: %v", err)
+	//}
+	//defer term.Close()
+
+	// Set stdin in raw mode.
+	ptr := int(os.Stdin.Fd())
+	oldState, err := terminal.MakeRaw(ptr)
 	if err != nil {
-		return fmt.Errorf("Error setting raw terminal: %v", err)
+		panic(err)
 	}
-	defer term.Reset()
+	defer func() {
+		terminal.Restore(ptr, oldState)
+	}()
 
 	wg := &sync.WaitGroup{}
 
-	wg.Add(1)
-	go c.termsizeLoop(wg)
+	if !c.Webconsole {
+		wg.Add(1)
+		go c.termsizeLoop(wg)
+	}
 
 	wg.Add(1)
 	go c.readLoop(wg)
@@ -330,7 +466,6 @@ func (c *Client) Loop() error {
 
 	/* Wait for all of the above goroutines to finish */
 	wg.Wait()
-
 	logrus.Debug("Client.Loop() exiting")
 	return nil
 }
@@ -415,10 +550,10 @@ func (c *Client) writeLoop(wg *sync.WaitGroup) posionReason {
 	buff := make([]byte, 128)
 
 	rdfs := &goselect.FDSet{}
-	reader := io.ReadCloser(os.Stdin)
-
+	reader := io.ReadWriteCloser(os.Stdin)
 	pr := NewEscapeProxy(reader, c.EscapeKeys)
-	defer reader.Close()
+	// 此方法总关闭 reader 会导致上层调用无法恢复 os.Stdin 状态
+	//defer reader.Close()
 
 	for {
 		select {
@@ -465,7 +600,6 @@ func (c *Client) writeLoop(wg *sync.WaitGroup) posionReason {
 			}
 		}
 	}
-
 }
 
 func (c *Client) readLoop(wg *sync.WaitGroup) posionReason {
@@ -490,7 +624,6 @@ func (c *Client) readLoop(wg *sync.WaitGroup) posionReason {
 			return die(fname, c.poison)
 		case msg := <-msgChan:
 			if msg.Err != nil {
-
 				if _, ok := msg.Err.(*websocket.CloseError); !ok {
 					logrus.Warnf("c.Conn.ReadMessage: %v", msg.Err)
 				}
@@ -518,7 +651,11 @@ func (c *Client) readLoop(wg *sync.WaitGroup) posionReason {
 			case c.message.setReconnect: // autoreconnect
 				logrus.Debugf("Unhandled protocol message: autoreconnect: %s", string(msg.Data))
 			default:
-				logrus.Warnf("Unhandled protocol message: %s", string(msg.Data))
+				if !c.Webconsole {
+					logrus.Warnf("Unhandled protocol message: %s", string(msg.Data))
+				} else {
+					c.Output.Write(msg.Data)
+				}
 			}
 		}
 	}

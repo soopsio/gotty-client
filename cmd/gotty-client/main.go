@@ -4,12 +4,13 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path"
 
 	"github.com/codegangsta/cli"
-	"github.com/moul/gotty-client"
 	"github.com/sirupsen/logrus"
+	"github.com/soopsio/gotty-client"
 )
 
 var VERSION string
@@ -67,6 +68,25 @@ func main() {
 			Usage:  "WebSocket Origin URL",
 			EnvVar: "GOTTY_CLIENT_WS_ORIGIN",
 		},
+		cli.BoolFlag{
+			Name:   "webconsole",
+			Usage:  "Connect webconsole server",
+			EnvVar: "WEBCONSOLE",
+		},
+		cli.StringFlag{
+			Name:  "server-addr,s",
+			Usage: "SSHD server addr",
+		},
+		cli.StringFlag{
+			Name:   "username,u",
+			Usage:  "SSHD username",
+			EnvVar: "WEBCONSOLE_SSH_USERNAME",
+		},
+		cli.StringFlag{
+			Name:   "password,p",
+			Usage:  "SSH password",
+			EnvVar: "WEBCONSOLE_SSH_PASSWORD",
+		},
 	}
 
 	app.Action = action
@@ -119,7 +139,26 @@ func action(c *cli.Context) error {
 		}
 	}
 
+	// webconsole 模式参数
+	if c.Bool("webconsole") {
+		client.Webconsole = true
+	}
+
+	if serverAddr := c.String("server-addr"); serverAddr != "" {
+		client.ServerAddr = serverAddr
+	}
+
+	if username := c.String("username"); username != "" {
+		client.Username = username
+	}
+
+	if password := c.String("password"); password != "" {
+		client.Password = password
+	}
+
 	// loop
+	defer log.Println("9999999999")
+	defer os.Exit(0)
 	if err = client.Loop(); err != nil {
 		logrus.Fatalf("Communication error: %v", err)
 	}
